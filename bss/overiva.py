@@ -70,10 +70,11 @@ References
 """
 import numpy as np
 
+from .head import HEADUpdate, head_error, head_solver, head_update_ncg
 from .projection_back import project_back
-from .update_rules import (_block_ip, _ip_double, _ip_double_two_channels,
-                           _ip_single, _ipa, _iss_single,
-                           _joint_demix_background,
+from .update_rules import (_block_ip, _ip_double, _ip_double_sub,
+                           _ip_double_two_channels, _ip_single, _ipa, _ipa2,
+                           _iss_single, _joint_demix_background,
                            _parametric_background_update)
 from .utils import TwoStepsIterator, demix, tensor_H
 
@@ -85,9 +86,29 @@ _update_rules_choice = [
     "ip-block",
     "ip2-block",
     "ipa",
-    "auxiva-iss",
+    "ipa2",
+    "iss",
+    "iss2",
+    "ipancg",
+    "fullhead",
+    "ipa-all",
 ]
-_dual_update_rules = ["ip2-param", "ip2-block", "ipa"]
+# _dual_update_rules = ["ip2-param", "ip2-block"]
+_dual_update_rules = []
+
+def aux_variable_update(Y, model):
+    # update the source model
+    # shape: (n_src, n_frames)
+    if model == "laplace":
+        r_inv = 1.0 / np.maximum(_eps, 2.0 * np.linalg.norm(Y, axis=0))
+    elif model == "gauss":
+        r_inv = 1.0 / np.maximum(
+            _eps, (np.linalg.norm(Y, axis=0) ** 2) / n_freq
+        )
+    else:
+        raise NotImplementedError()
+
+    return r_inv
 
 
 def overiva_ip_param(X, **kwargs):
@@ -111,24 +132,49 @@ def overiva_ip2_block(X, **kwargs):
 
 
 def auxiva(X, **kwargs):
-    kwargs.pop("n_src")
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
     return overiva(X, n_src=None, update_rule="ip-param", **kwargs)
 
 
 def auxiva2(X, **kwargs):
-    kwargs.pop("n_src")
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
     return overiva(X, n_src=None, update_rule="ip2-param", **kwargs)
 
 
 def auxiva_iss(X, **kwargs):
-    kwargs.pop("n_src")
-    return overiva(X, n_src=None, update_rule="auxiva-iss", **kwargs)
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
+    return overiva(X, n_src=None, update_rule="iss", **kwargs)
+
+def auxiva_iss2(X, **kwargs):
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
+    return overiva(X, n_src=None, update_rule="iss2", **kwargs)
 
 
 def auxiva_ipa(X, **kwargs):
-    kwargs.pop("n_src")
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
     return overiva(X, n_src=None, update_rule="ipa", **kwargs)
 
+def auxiva_ipa2(X, **kwargs):
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
+    return overiva(X, n_src=None, update_rule="ipa2", **kwargs)
+
+
+def auxiva_ipancg(X, **kwargs):
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
+    return overiva(X, n_src=None, update_rule="ipancg", **kwargs)
+
+
+def auxiva_fullhead(X, **kwargs):
+    if "n_src" in kwargs:
+        kwargs.pop("n_src")
+    return overiva(X, n_src=None, update_rule="fullhead", **kwargs)
 
 def overiva(
     X,
@@ -230,19 +276,12 @@ def overiva(
 
     for epoch in range(0, n_iter, iter_step):
 
-        # update the source model
-        # shape: (n_src, n_frames)
-        if model == "laplace":
-            r_inv[:, :] = 1.0 / np.maximum(_eps, 2.0 * np.linalg.norm(Y, axis=0))
-        elif model == "gauss":
-            r_inv[:, :] = 1.0 / np.maximum(
-                _eps, (np.linalg.norm(Y, axis=0) ** 2) / n_freq
-            )
-
         # Update now the demixing matrix
         # using the requested algorithm
 
         if update_rule == "ip-param":
+
+            r_inv = aux_variable_update(Y, model)
 
             for s in range(n_src):
 
@@ -253,28 +292,55 @@ def overiva(
                 # Iterative Projection
                 _ip_single(s, X, W, r_inv[s, :])
 
+            demix(Y, X, W[:, :n_src, :])
+
         elif update_rule == "ip2-param":
 
-            # Update source pairs with a joint IP2 update
-            for s1, s2 in TwoStepsIterator(n_src):
-
-                if n_src < n_chan:
-                    _parametric_background_update(n_src, W, Cx)
-
-                # Iterative Projection 2
-                if n_chan == 2:
+            if n_chan == 2 and n_src == 2:
+                # we run two loops here because the algorithm is two at a time here
+                for s in range(2):
+                    r_inv = aux_variable_update(Y, model)
                     _ip_double_two_channels(X, W, r_inv)
-                else:
-                    _ip_double(s1, s2, X, W, r_inv[[s1, s2], :])
+                    demix(Y, X, W[:, :n_src, :])
+
+            else:
+
+                r_inv = aux_variable_update(Y, model)
+
+                # compute all the covariance matrices
+                V = [
+                    (X * r_inv[k, None, None, :]) @ tensor_H(X) / n_frames
+                    for k in range(n_src)
+                ]
+
+                # enforce hermitian symmetry of covariance matrices
+                for i, vv in enumerate(V):
+                    V[i] = 0.5 * (vv + tensor_H(vv))
+
+                # Update source pairs with a joint IP2 update
+                for s1, s2 in TwoStepsIterator(n_src):
+
+                    if n_src < n_chan:
+                        _parametric_background_update(n_src, W, Cx)
+
+                    # Iterative Projection 2
+                    _ip_double_sub(s1, s2, [V[s1], V[s2]], W)
+
+                demix(Y, X, W[:, :n_src, :])
 
         elif update_rule == "demix-bg":
 
             assert n_chan > n_src, "demix-bg only works in the overdetermined case"
 
+            r_inv = aux_variable_update(Y, model)
             for s in range(n_src):
                 _joint_demix_background(s, n_src, X, W, r_inv[s, :], Cx)
 
+            demix(Y, X, W[:, :n_src, :])
+
         elif update_rule == "ip-block":
+
+            r_inv = aux_variable_update(Y, model)
 
             # Update each source with an IP update
             for s in range(n_src):
@@ -286,25 +352,52 @@ def overiva(
                 # Iterative Projection
                 _ip_single(s, X, W, r_inv[s, :])
 
+            demix(Y, X, W[:, :n_src, :])
+
         elif update_rule == "ip2-block":
 
             # Update source pairs with a joint IP2 update
-            for s1, s2 in TwoStepsIterator(n_src):
-
-                if n_src < n_chan:
-                    # Update the background with a block IP update
-                    _block_ip(list(range(n_src, n_chan)), X, W, Cx)
-
-                # Iterative Projection 2
-                _ip_double(s1, s2, X, W, r_inv[[s1, s2], :])
-
-        elif update_rule == "ipa":
+            r_inv = aux_variable_update(Y, model)
 
             # compute all the covariance matrices
             V = [
                 (X * r_inv[k, None, None, :]) @ tensor_H(X) / n_frames
                 for k in range(n_src)
             ]
+
+            # enforce hermitian symmetry of covariance matrices
+            for i, vv in enumerate(V):
+                V[i] = 0.5 * (vv + tensor_H(vv))
+
+            for s1, s2 in TwoStepsIterator(n_src):
+
+                if n_src < n_chan:
+                    assert "This part needs fixing"
+                    # Update the background with a block IP update
+                    _block_ip(list(range(n_src, n_chan)), X, W, Cx)
+
+                # Iterative Projection 2
+                _ip_double_sub(s1, s2, [V[s1], V[s2]], W)
+
+                """
+                # implementation for update of aux. var at each iteration
+                r_inv = aux_variable_update(Y[:, [s1, s2], :])
+                _ip_double(s1, s2, X, W, r_inv)
+                Y[:, [s1, s2], :] = W[:, [s1, s2], :] @ X
+                """
+
+            demix(Y, X, W[:, :n_src, :])
+
+        elif update_rule == "ipa":
+
+            r_inv = aux_variable_update(Y, model)
+
+            # compute all the covariance matrices
+            V = [
+                (X * r_inv[k, None, None, :]) @ tensor_H(X) / n_frames
+                for k in range(n_src)
+            ]
+
             # enforce hermitian symmetry of covariance matrices
             for i, vv in enumerate(V):
                 V[i] = 0.5 * (vv + tensor_H(vv))
@@ -312,22 +405,97 @@ def overiva(
             for k in range(n_src):
                 W[:] = _ipa(V, W, k)
 
-        elif update_rule == "auxiva-iss":
+            demix(Y, X, W[:, :n_src, :])
+
+        elif update_rule == "ipa2":
+
+            for k in range(n_src):
+                r_inv = aux_variable_update(Y, model)
+
+                # updates both W and Y in-place
+                _ipa2(k, Y, W, r_inv)
+
+        elif update_rule == "ipancg":
+
+            r_inv = aux_variable_update(Y, model)
+
+            # compute all the covariance matrices
+            V = np.array(
+                [
+                    (X * r_inv[k, None, None, :]) @ tensor_H(X) / n_frames
+                    for k in range(n_src)
+                ]
+            )
+
+            # enforce hermitian symmetry of covariance matrices
+            for i, vv in enumerate(V):
+                V[i] = 0.5 * (vv + tensor_H(vv))
+
+            # check the value of the head_error
+            error = np.mean(head_error(V.swapaxes(0, 1), W))
+            # print(f"HEAD error:", error)
+            if error < 1e-5:
+                # print(f"epoch={epoch} use NCG")
+                W[:] = head_update_ncg(V.swapaxes(0, 1), W)
+            else:
+                for k in range(n_src):
+                    W[:] = _ipa(V, W, k)
+
+            demix(Y, X, W[:, :n_src, :])
+
+        elif update_rule == "fullhead":
+            r_inv = aux_variable_update(Y, model)
+
+            # compute all the covariance matrices
+            V = np.array(
+                [
+                    (X * r_inv[k, None, None, :]) @ tensor_H(X) / n_frames
+                    for k in range(n_src)
+                ]
+            )
+
+            # enforce hermitian symmetry of covariance matrices
+            for i, vv in enumerate(V):
+                V[i] = 0.5 * (vv + tensor_H(vv))
+
+            # now solve head
+            tol = 1e-20 if "tol" not in kwargs else kwargs["tol"]
+            W[:], info = head_solver(
+                V.swapaxes(0, 1), W=W, method=HEADUpdate.IPA, tol=tol, info=True
+            )
+
+            demix(Y, X, W[:, :n_src, :])
+
+        elif update_rule == "iss":
 
             assert n_chan == n_src, "ISS is only implemented in the determined case"
+
+            r_inv = aux_variable_update(Y, model)
 
             for k in range(n_chan):
                 _iss_single(k, X, W, r_inv)
 
+            demix(Y, X, W[:, :n_src, :])
+
+        elif update_rule == "iss2":
+
+            assert n_chan == n_src, "ISS is only implemented in the determined case"
+
+            for k in range(n_chan):
+                r_inv = aux_variable_update(Y, model)
+                _iss_single(k, X, W, r_inv)
+                demix(Y, X, W[:, :n_src, :])
+
         else:
             raise ValueError("Invalid update rules")
-
-        demix(Y, X, W[:, :n_src, :])
 
         # Monitor the algorithm progression
         if callback is not None and (epoch + iter_step) in callback_checkpoints:
             Y_tmp = Y.transpose([2, 0, 1])
-            callback(Y_tmp, model)
+            if "eval_demix_mat" in kwargs:
+                callback(Y_tmp.copy(), W.copy(), model)
+            else:
+                callback(Y_tmp, model)
 
     Y = Y.transpose([2, 0, 1]).copy()
 

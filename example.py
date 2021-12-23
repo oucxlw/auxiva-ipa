@@ -36,12 +36,16 @@ from scipy.io import wavfile
 import bss
 import get_data
 import pyroomacoustics as pra
+
 # Get the data if needed
 from pyroomacoustics.bss import projection_back
-from room_builder import (callback_noise_mixer, choose_target_locations,
-                          convergence_callback, random_locations)
-from routines import (PlaySoundGUI, grid_layout, random_layout,
-                      semi_circle_layout)
+from room_builder import (
+    callback_noise_mixer,
+    choose_target_locations,
+    convergence_callback,
+    random_locations,
+)
+from routines import PlaySoundGUI, grid_layout, random_layout, semi_circle_layout
 from samples.generate_samples import sampling, wav_read_center
 
 samples_dir = "samples/"
@@ -182,7 +186,7 @@ if __name__ == "__main__":
         n_iter += 1
 
     # param ogive
-    ogive_mu = 0.1
+    ogive_mu = 0.3
 
     room_dim = config["room"]["room_kwargs"]["p"]
     mic_array_center = np.array(config["room"]["mic_array_location_m"])
@@ -191,7 +195,11 @@ if __name__ == "__main__":
     mic_radius = 0.5 * mic_delta / np.sin(np.pi / n_mics)
     print("mic_radius", mic_radius, "m")
     rel_mics_locs = np.vstack(
-        [mic_radius * np.cos(angles), mic_radius * np.sin(angles), np.zeros(n_mics),]
+        [
+            mic_radius * np.cos(angles),
+            mic_radius * np.sin(angles),
+            np.zeros(n_mics),
+        ]
     )
     mic_locs = mic_array_center[:, None] + rel_mics_locs
     critical_distance = config["room"]["critical_distance_m"]
@@ -287,9 +295,9 @@ if __name__ == "__main__":
         callback_checkpoints = [1]
     else:
         if bss.is_dual_update[args.algo]:
-            callback_checkpoints = list(range(2, n_iter + 1, 2))
+            callback_checkpoints = list(range(0, n_iter + 1, 2))
         else:
-            callback_checkpoints = list(range(1, n_iter + 1))
+            callback_checkpoints = list(range(0, n_iter + 1))
 
     if args.no_cb:
         callback_checkpoints = [1]
@@ -306,7 +314,8 @@ if __name__ == "__main__":
     tic = time.perf_counter()
 
     # First evaluation of SDR/SIR
-    cb_local(X_mics[:, :, :n_sources_target], args.dist)
+    if args.algo != "fastiva":
+        cb_local(X_mics[:, :, :n_sources_target], args.dist)
 
     Y, W = bss.separate(
         X_mics,
@@ -370,7 +379,7 @@ if __name__ == "__main__":
     plt.tight_layout(pad=0.5)
 
     plt.figure()
-    plt.plot([0] + callback_checkpoints, cost_list)
+    plt.plot(callback_checkpoints, cost_list)
     plt.title("Cost function")
     plt.xlabel("Iteration")
     plt.ylabel("Cost")
@@ -378,8 +387,8 @@ if __name__ == "__main__":
 
     plt.figure()
     for s in range(n_sources_target):
-        plt.plot([0] + callback_checkpoints, SDR[:, s], label=f"SDR {s+1}", marker="*")
-        plt.plot([0] + callback_checkpoints, SIR[:, s], label=f"SIR {s+1}", marker="o")
+        plt.plot(callback_checkpoints, SDR[:, s], label=f"SDR {s+1}", marker="*")
+        plt.plot(callback_checkpoints, SIR[:, s], label=f"SIR {s+1}", marker="o")
     plt.title(args.algo)
     plt.legend()
     plt.tight_layout(pad=0.5)

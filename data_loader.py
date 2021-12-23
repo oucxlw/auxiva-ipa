@@ -28,6 +28,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+threshold_convergence = 1e-4
+threshold_convergence_one_step = 1e-0
+
 # This table maps some of the labels we used in the
 # simulation to labels we would like to use in the figures
 # of the paper
@@ -49,7 +52,16 @@ substitutions = {
         "auxiva_pca": "PCA+AuxIVA-IP",
         "auxiva_demix_steer_nopca": "AuxIVA-IPA",
         "auxiva_demix_steer_pca": "AuxIVA-IPA (PCA)",
+        "auxiva_ipa_nopca": "AuxIVA-IPA",
+        "auxiva_ipa_pca": "AuxIVA-IPA (PCA)",
+        "auxiva_ipa2_nopca": "AuxIVA-IPA2",
+        "auxiva_ipa2_pca": "AuxIVA-IPA2 (PCA)",
+        "auxiva_ipa2": "AuxIVA-IPA2 (PCA)",
         "overiva_demix_steer": "OverIVA-IPA",
+        "fastiva": "FastIVA (PCA)",
+        "fastiva_nopca": "FastIVA",
+        "iva_ng_0.3": "IVA-NG (PCA)",
+        "iva_ng_0.3_nopca": "IVA-NG",
         "pca": "PCA",
     }
 }
@@ -90,12 +102,16 @@ def load_data(dirs, pickle=False):
     # check if a pickle file exists for these files
     pickle_file = f".{parameters['name']}.pickle"
     rt60_file = ".rt60.pickle"
+    convergence_file = ".convergence.pickle"
+    final_value_file = ".final_value.pickle"
 
     if os.path.isfile(pickle_file) and pickle:
         print("Reading existing pickle file...")
         # read the pickle file
         df = pd.read_pickle(pickle_file)
         rt60 = pd.read_pickle(rt60_file)
+        conv_tbl = pd.read_pickle(convergence_file)
+        final_value_tbl = pd.read_pickle(final_value_file)
 
     else:
 
@@ -129,6 +145,8 @@ def load_data(dirs, pickle=False):
             "Success",
         ]
         table = []
+        convergence_table = []
+        final_value_table = []
         num_sources = set()
 
         copy_fields = [
@@ -143,6 +161,7 @@ def load_data(dirs, pickle=False):
         ]
 
         number_failed_records = 0
+        failed_algorithms = {}
 
         for record in records:
 
@@ -166,12 +185,56 @@ def load_data(dirs, pickle=False):
             runtime = record["runtime"] / record["n_samples"] * fs / algo_n_iter
             evaltime = record["eval_time"] / record["n_samples"] * fs / algo_n_iter
 
-            if len(record["sdr"]) == 2 and np.any(np.isnan(record["sdr"][-1])):
+            if np.any(np.isnan(record["sdr"][-1])):
                 number_failed_records += 1
+                if record["algorithm"] not in failed_algorithms:
+                    failed_algorithms[record["algorithm"]] = 1
+                else:
+                    failed_algorithms[record["algorithm"]] += 1
                 continue
 
+            # fill the convergence table
+            checkpoints_interp = np.arange(checkpoints[-1] + 1)
+            cost_interp = np.interp(
+                np.arange(checkpoints[-1] + 1), checkpoints, record["cost"]
+            )
+            cost_init = record["cost"][0]
+            converged_iter = None
+            for i, (n_iter, cost) in enumerate(zip(checkpoints_interp, cost_interp)):
+                if i == 0:
+                    continue
+
+                progress_one_step = cost - cost_interp[-1]
+                progress_total = cost - cost_init
+
+                """
+                if (
+                    np.abs(progress_one_step) / np.abs(progress_total)
+                    < threshold_convergence
+                ):
+                    converged_iter = n_iter
+                    break
+                """
+                if (
+                    progress_one_step
+                    < record["n_mics"] * threshold_convergence_one_step
+                ):
+                    converged_iter = n_iter
+                    break
+
+            entry = [record[field] for field in copy_fields]
+            if converged_iter is None:
+                convergence_table.append(entry + [np.nan, np.nan])
+            else:
+                convergence_table.append(
+                    entry + [converged_iter, converged_iter * runtime]
+                )
+
+            # fill the SDR/SIR table
             sdr_i = np.array(record["sdr"][0])  # Initial SDR
             sir_i = np.array(record["sir"][0])  # Initial SDR
+
+            loop_len = min(len(checkpoints), len(record["sdr"]), len(record["sir"]))
 
             for i, (n_iter, sdr, sir) in enumerate(
                 zip(checkpoints, record["sdr"], record["sir"])
@@ -186,18 +249,22 @@ def load_data(dirs, pickle=False):
 
                 try:
                     sdr_f = np.array(sdr)  # Final SDR
-                    sir_f = np.array(sir)  # Final SDR
+                    sir_f = np.array(sir)  # Final SIR
 
-                    table.append(
-                        entry
-                        + [
-                            np.mean(sdr_f),
-                            np.mean(sir_f),
-                            np.mean(sdr_f - sdr_i),
-                            np.mean(sir_f - sir_i),
-                            float(np.mean(sir_f > 0.0)),
-                        ]
-                    )
+                    new_entry = entry + [
+                        np.mean(sdr_f),
+                        np.mean(sir_f),
+                        np.mean(sdr_f - sdr_i),
+                        np.mean(sir_f - sir_i),
+                        float(np.mean(sir_f > 0.0)),
+                    ]
+
+                    table.append(new_entry)
+
+                    # record the final value only in a separate table too
+                    if i == loop_len - 1:
+                        final_value_table.append(new_entry)
+
                 except Exception:
                     continue
 
@@ -205,19 +272,35 @@ def load_data(dirs, pickle=False):
         print("Making PANDAS frame...")
         df = pd.DataFrame(table, columns=columns)
         rt60 = pd.DataFrame(rt60_list, columns=["RT60"])
+        conv_tbl = pd.DataFrame(
+            convergence_table, columns=columns[:8] + ["Iterations", "Runtime"]
+        )
+        final_value_tbl = pd.DataFrame(final_value_table, columns=columns)
 
         df.to_pickle(pickle_file)
         rt60.to_pickle(rt60_file)
+        conv_tbl.to_pickle(convergence_file)
+        final_value_tbl.to_pickle(final_value_file)
 
         if number_failed_records > 0:
             import warnings
 
+            def _warning(message, *args, **kwargs):
+                print(message)
+
+            warnings.showwarning = _warning
+
             warnings.warn(f"Number of failed record: {number_failed_records}")
+            print(f"Summary of {number_failed_records} failures:")
+            for algo, n_fail in failed_algorithms.items():
+                print(f"{algo}: {n_fail}")
 
     # apply the subsititutions
     df = df.replace(substitutions)
+    conv_tbl = conv_tbl.replace(substitutions)
+    final_value_tbl = final_value_tbl.replace(substitutions)
 
-    return df, rt60, parameters
+    return df, final_value_tbl, conv_tbl, rt60, parameters
 
 
 if __name__ == "__main__":
@@ -243,4 +326,6 @@ if __name__ == "__main__":
     dirs = args.dirs
     pickle = args.pickle
 
-    df, rt60, parameters = load_data(args.dirs, pickle=pickle)
+    df, final_value_tbl, conv_tbl, rt60, parameters = load_data(
+        args.dirs, pickle=pickle
+    )

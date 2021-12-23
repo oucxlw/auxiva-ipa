@@ -34,6 +34,7 @@ import seaborn as sns
 from matplotlib.ticker import MaxNLocator
 
 from data_loader import load_data
+from plot_config import seaborn_config
 
 matplotlib.rc("pdf", fonttype=42)
 
@@ -57,6 +58,9 @@ if __name__ == "__main__":
         help="Display the plots at the end of data analysis",
     )
     parser.add_argument(
+        "--pca", action="store_true", help="Plot results for PCA initialization",
+    )
+    parser.add_argument(
         "dirs",
         type=str,
         nargs="+",
@@ -68,14 +72,15 @@ if __name__ == "__main__":
     plot_flag = cli_args.show
     pickle_flag = cli_args.pickle
 
-    df, rt60, parameters = load_data(cli_args.dirs, pickle=pickle_flag)
+    df_all_iters, final_val_tbl, conv_tbl, rt60, parameters = load_data(
+        cli_args.dirs, pickle=pickle_flag
+    )
+
+    # in this script, we only care about the final values
+    df = final_val_tbl
 
     # Draw the figure
     print("Plotting...")
-
-    # sns.set(style='whitegrid')
-    # sns.plotting_context(context='poster', font_scale=2.)
-    # pal = sns.cubehelix_palette(8, start=0.5, rot=-.75)
 
     df_melt = df.melt(id_vars=df.columns[:-5], var_name="metric")
     # df_melt = df_melt.replace(substitutions)
@@ -97,29 +102,21 @@ if __name__ == "__main__":
         .reset_index()
     )
 
+    if cli_args.pca:
+        pca_str = " (PCA)"
+    else:
+        pca_str = ""
+
     all_algos = [
-        "AuxIVA-IP",
-        "AuxIVA-ISS",
-        "AuxIVA-IP2",
-        "AuxIVA-IPA",
+        "IVA-NG" + pca_str,
+        "FastIVA" + pca_str,
+        "AuxIVA-IP" + pca_str,
+        "AuxIVA-ISS" + pca_str,
+        "AuxIVA-IP2" + pca_str,
+        "AuxIVA-IPA" + pca_str,
     ]
 
-    sns.set(
-        style="whitegrid",
-        context="paper",
-        font_scale=0.75,
-        rc={
-            # 'figure.figsize': (3.39, 3.15),
-            "lines.linewidth": 1.0,
-            # 'font.family': 'sans-serif',
-            # 'font.sans-serif': [u'Helvetica'],
-            # 'text.usetex': False,
-        },
-    )
-    pal = sns.cubehelix_palette(
-        4, start=0.5, rot=-0.5, dark=0.3, light=0.75, reverse=True, hue=1.0
-    )
-    sns.set_palette(pal)
+    seaborn_config(n_colors=len(all_algos), style="whitegrid")
 
     if not os.path.exists("figures"):
         os.mkdir("figures")
@@ -132,9 +129,12 @@ if __name__ == "__main__":
         os.mkdir(fig_dir)
 
     plt_kwargs = {
-        # "improvements": {"ylim": [-5.5, 20.5], "yticks": [-5, 0, 5, 10, 15]},
-        # "raw": {"ylim": [-5.5, 20.5], "yticks": [-5, 0, 5, 10, 15]},
-        # "runtime": {"ylim": [-0.5, 40.5], "yticks": [0, 10, 20, 30]},
+        "improvements": {
+            "yticks": [[-10, 0, 10, 20], [-10, 0, 10, 20], [0, 10, 20, 30]],
+        },
+        "raw": {
+            "yticks": [[-20, -10, 0, 10, 20], [-10, 0, 10, 20], [-10, 0, 10, 20, 30]],
+        },
     }
 
     full_width = 6.93  # inches, == 17.6 cm, double column width
@@ -148,20 +148,22 @@ if __name__ == "__main__":
     }
 
     # width = aspect * height
-    aspect = 3 / 2  # width / height
-    height = half_width / 3
+    aspect = 1.2  # width / height
+    height = (half_width / 2) / aspect
     # height = 1.6
 
     iteration_index = 12
     n_interferers = 0
+
+    # first we need to pair the algorithm with their maximum number of iterations
 
     for m_name in the_metrics.keys():
 
         metric = the_metrics[m_name]
 
         select = (
-            np.logical_or(df_melt["Iteration"] == 100, df_melt["Iteration"] == 2000)
-            & (df_melt["Interferers"] == n_interferers)
+            # np.logical_or(df_melt["Iteration"] == 100, df_melt["Iteration"] == 2000) &
+            (df_melt["Interferers"] == n_interferers)
             & df_melt.metric.isin(metric)
         )
 
@@ -192,7 +194,7 @@ if __name__ == "__main__":
         [plt.setp(ax.texts, text="") for ax in g.axes.flat]
         g.set_titles(col_template="{col_name}", row_template="SNR {row_name} dB")
         g.set_ylabels("Decibels")
-        g.set_xlabels("# Sources/Mics")
+        g.set_xlabels("# channels")
 
         # remove the white background on the margin titles on the right
         for the_ax in g.axes.flat:
@@ -201,22 +203,39 @@ if __name__ == "__main__":
 
         all_artists = []
 
-        # left_ax = g.facet_axis(2, 0)
-        left_ax = g.facet_axis(0, 0)
-        leg = left_ax.legend(
-            title="",
-            frameon=True,
-            framealpha=0.85,
-            fontsize="x-small",
-            loc="upper left",
-            bbox_to_anchor=[-0.07, 1.00],
-        )
-        leg.get_frame().set_linewidth(0.2)
-        all_artists.append(leg)
+        leg_handles = {}
+        for r in range(3):
+            for c, _ in enumerate(metric):
+                if m_name in plt_kwargs and r < len(plt_kwargs[m_name]["yticks"]):
+                    g.facet_axis(r, c).set_yticks(plt_kwargs[m_name]["yticks"][r])
+
+                handles, labels = g.facet_axis(r, c).get_legend_handles_labels()
+                for lbl, hand in zip(labels, handles):
+                    if lbl not in leg_handles:
+                        if lbl.endswith(" (PCA)"):
+                            lbl = lbl[:-6]
+                        leg_handles[lbl] = hand
 
         sns.despine(offset=10, trim=False, left=True, bottom=True)
+        g.fig.tight_layout()
 
-        plt.tight_layout()
+        left_ax = g.facet_axis(0, 0)
+        leg = g.fig.legend(
+            leg_handles.values(),
+            leg_handles.keys(),
+            title="",
+            frameon=False,
+            framealpha=0.85,
+            fontsize="xx-small",
+            loc="upper center",
+            bbox_to_anchor=[0.5, 1.01],
+            ncol=len(all_algos),
+        )
+        # leg.get_frame().set_linewidth(0.0)
+        all_artists.append(leg)
+        g.fig.align_ylabels()
+
+        g.fig.subplots_adjust(top=0.90)
 
         """
         for c, lbl in enumerate(metric):
@@ -225,8 +244,9 @@ if __name__ == "__main__":
         """
 
         for ext in ["pdf", "png"]:
+            pca_fn_str = "_pca" if cli_args.pca else ""
             fig_fn = os.path.join(
-                fig_dir, f"figure3_{m_name}_interf{n_interferers}.{ext}"
+                fig_dir, f"figure3_{m_name}_interf{n_interferers}{pca_fn_str}.{ext}"
             )
             plt.savefig(
                 fig_fn, bbox_extra_artists=all_artists
